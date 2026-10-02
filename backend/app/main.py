@@ -5,6 +5,11 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.modules.handover import confirm as handover_confirm
+from app.modules.handover import preview as handover_preview
+from app.modules.handover import projection as handover_projection
+from app.modules.handover import service as handover_service
+from app.modules.handover.errors import HandoverError
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -49,11 +54,12 @@ def week_board(week_id: int):
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    handovers = handover_projection.handover_projection(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    return {"week": dict(week), "assignments": assigns, "handovers": handovers}
 
 class GenBody(BaseModel):
     days: int = 7
@@ -124,3 +130,85 @@ def put_settings(body: dict):
     for k, v in body.items():
         c.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
     c.commit(); c.close(); return {"ok": True}
+
+
+# ---- 离场交接条：预览(只读) → 签发 → 确认写库 → 停用闸门 ----
+
+def _handover_http(e: HandoverError) -> HTTPException:
+    return HTTPException(404 if e.reason.endswith("_not_found") else 400, e.reason)
+
+
+class HandoverPreviewIn(BaseModel):
+    from_member_id: int
+    to_member_id: int | None = None
+
+
+class HandoverIssueIn(BaseModel):
+    from_member_id: int
+    to_member_id: int
+    note: str = ""
+
+
+class DeactivateIn(BaseModel):
+    week_id: int
+
+
+@app.post("/api/weeks/{week_id}/handovers/preview")
+def preview_handover(week_id: int, body: HandoverPreviewIn):
+    """预览将被接管的格子，不改库。"""
+    c = connect()
+    try:
+        out = handover_preview.preview_takeover(c, week_id, body.from_member_id, body.to_member_id)
+    except HandoverError as e:
+        c.close(); raise _handover_http(e)
+    c.close(); return out
+
+
+@app.post("/api/weeks/{week_id}/handovers")
+def issue_handover(week_id: int, body: HandoverIssueIn):
+    c = connect()
+    try:
+        out = handover_service.issue_handover(c, week_id, body.from_member_id, body.to_member_id, body.note)
+    except HandoverError as e:
+        c.close(); raise _handover_http(e)
+    c.commit(); c.close(); return out
+
+
+@app.get("/api/weeks/{week_id}/handovers")
+def list_handovers(week_id: int):
+    c = connect(); rows = handover_projection.handover_projection(c, week_id); c.close(); return rows
+
+
+@app.get("/api/handovers/{handover_id}")
+def get_handover(handover_id: int):
+    """交接详情，与看板钉住的移交清单同构。"""
+    c = connect()
+    try:
+        out = handover_projection.handover_detail(c, handover_id)
+    except HandoverError as e:
+        c.close(); raise _handover_http(e)
+    c.close(); return out
+
+
+@app.post("/api/handovers/{handover_id}/confirm")
+def confirm_handover(handover_id: int):
+    """确认：格子改派接收人，仍引用交出人旧身份的 pending 对调自动作废。"""
+    c = connect()
+    try:
+        result = handover_confirm.confirm_handover(c, handover_id)
+        detail = handover_projection.handover_detail(c, handover_id)
+    except HandoverError as e:
+        c.rollback(); c.close(); raise _handover_http(e)
+    c.commit(); c.close()
+    return {"ok": True, **result, "handover": detail}
+
+
+@app.post("/api/members/{member_id}/deactivate")
+def deactivate_member(member_id: int, body: DeactivateIn):
+    """停用成员：无该周已确认交接条则拒绝。"""
+    c = connect()
+    try:
+        out = handover_service.deactivate_member(c, member_id, body.week_id)
+    except HandoverError as e:
+        c.rollback(); c.close(); raise _handover_http(e)
+    c.commit(); c.close(); return out

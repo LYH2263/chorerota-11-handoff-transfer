@@ -14,6 +14,7 @@
       <li v-for="s in rows" :key="s.id">
         #{{ s.id }} D{{ s.a_day }}/T{{ s.a_task }} ↔ D{{ s.b_day }}/T{{ s.b_task }}
         <span class="chip" :class="{ coral: s.status==='pending' }">{{ s.status }}</span>
+        <span v-if="s.note" class="muted"> · {{ s.note }}</span>
         <button v-if="s.status==='pending'" style="margin-left:8px" @click="confirm(s.id)">确认改表</button>
       </li>
     </ul>
